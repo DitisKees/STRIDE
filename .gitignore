@@ -1,0 +1,10 @@
+**/bin
+**/obj
+**/output 
+
+*.yaml
+.idea
+*.bak
+*.backup
+
+*.log

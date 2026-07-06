@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/STRIDE.Abstractions/STRIDE.Abstractions.csproj" />
+    <Project Path="src/STRIDE.Blocks/STRIDE.Blocks.csproj" />
+    <Project Path="src/STRIDE.Cli/STRIDE.Cli.csproj" />
+    <Project Path="src/STRIDE.Core/STRIDE.Core.csproj" />
+    <Project Path="src/STRIDE.Schema/STRIDE.Schema.csproj" />
+  </Folder>
+</Solution>
