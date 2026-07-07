@@ -1,6 +1,3 @@
-using System.Collections.Immutable;
-using System.Diagnostics.CodeAnalysis;
-
 namespace STRIDE.Abstractions;
 
 public enum FieldType : byte
@@ -12,7 +9,5 @@ public enum FieldType : byte
     Utf8String,
     DateTimeUtc,
     Geometry,
-    Null
+    Null,
 }
-
-public sealed record FieldDef(string Name, FieldType Type, bool Nullable);

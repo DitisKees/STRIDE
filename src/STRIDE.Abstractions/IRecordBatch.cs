@@ -3,15 +3,15 @@ namespace STRIDE.Abstractions;
 public interface IRecordBatch : IDisposable
 {
     Schema Schema { get; }
+
     int RowCount { get; }
 
-    // Null-controle per cel
-    bool IsNull(int ordinal, int rowIndex);
+    ReadOnlySpan<T> Column<T>(int ordinal)
+        where T : unmanaged;
 
-    // Primitives via high-performance zero-copy memory
-    ReadOnlyMemory<T> GetColumnMemory<T>(int ordinal) where T : unmanaged;
+    Utf8StringColumn StringColumn(int ordinal);
 
-    // Geavanceerde kolom-uitlezing via on-stack spans
-    Utf8StringColumn GetStringColumn(int ordinal);
-    GeometryColumn GetGeometryColumn(int ordinal);
+    GeometryColumn GeometryColumn(int ordinal);
+
+    string GetValueAsString(int ordinal, int rowIndex);
 }

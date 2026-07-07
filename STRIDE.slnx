@@ -5,5 +5,14 @@
     <Project Path="src/STRIDE.Cli/STRIDE.Cli.csproj" />
     <Project Path="src/STRIDE.Core/STRIDE.Core.csproj" />
     <Project Path="src/STRIDE.Schema/STRIDE.Schema.csproj" />
+    <Project Path="src/STRIDE.SourceGen/STRIDE.SourceGen.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/STRIDE.Abstractions.Tests/STRIDE.Abstractions.Tests.csproj" />
+    <Project Path="tests/STRIDE.Blocks.Tests/STRIDE.Blocks.Tests.csproj" />
+    <Project Path="tests/STRIDE.Cli.Tests/STRIDE.Cli.Tests.csproj" />
+    <Project Path="tests/STRIDE.Core.Tests/STRIDE.Core.Tests.csproj" />
+    <Project Path="tests/STRIDE.Schema.Tests/STRIDE.Schema.Tests.csproj" />
+    <Project Path="tests/STRIDE.SourceGen.Tests/STRIDE.SourceGen.Tests.csproj" />
   </Folder>
 </Solution>

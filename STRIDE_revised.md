@@ -86,7 +86,7 @@ public interface IRecordBatch : IDisposable
 - Geometry columns hold an `NTS Geometry[]` slice. Geometry is inherently reference-typed; batching keeps GC pressure bounded and predictable.
 - Batches are **immutable by contract**. Blocks that "modify" data (reproject, calculator) produce a **new output batch**, reusing unchanged columns by reference (structural sharing) and pooling the columns they replace. Immutability is what makes safe parallelism possible — there is no in-place mutation shared across workers (see [Section 4.3](#43-parallelism-and-thread-safety)).
 
-**Batch size** is configurable (default 4,096 rows) and participates in backpressure.
+**Batch size** is configurable (default 1,000 rows) and participates in backpressure.
 
 ---
 
@@ -102,7 +102,7 @@ name: "Large-Scale Geometry Processing"
 
 # Optional engine-level settings
 settings:
-  batchSize: 4096
+  batchSize: 1000
   maxDegreeOfParallelism: 8
   spillDirectory: "./.stride-spill"
   spillThresholdBytes: 1073741824   # 1 GiB per stateful block before spilling
@@ -145,7 +145,7 @@ nodes:
     errorPolicy: Ignore
 
   - id: route
-    type: ConditionalSplitter
+    type: TransformConditionalSplitter
     inputs: { in: buffer }
     params:
       branches:                          # each yields a named output port
@@ -171,8 +171,8 @@ sinks:
 
 ### 3.2 Rules
 
-- **Naming is consistent** everywhere: `Source*`, `Transform*`, `Sink*`, plus the standalone control block `ConditionalSplitter`. The catalog in [Section 6](#6-transformation-block-catalog) uses these exact type strings.
-- Edges are `inputs: { <portName>: <upstreamNodeId[:outputPort]> }`. Most blocks have a single input port `in` and a single implicit output; multi-input blocks (`SpatialJoin`, `Difference`, `SnapGeometries`) and multi-output blocks (`ConditionalSplitter`) declare additional ports.
+- **Naming is consistent** everywhere: `Source*`, `Transform*`, `Sink*`. The catalog in [Section 6](#6-transformation-block-catalog) uses these exact type strings.
+- Edges are `inputs: { <portName>: <upstreamNodeId[:outputPort]> }`. Most blocks have a single input port `in` and a single implicit output; multi-input blocks (`SpatialJoin`, `Difference`, `SnapGeometries`) and multi-output blocks (`TransformConditionalSplitter`) declare additional ports.
 - `sinks:` is a first-class list; **multiple sinks** are supported. Internally sinks are just nodes with no outgoing edges.
 - The graph is validated at load time (see [Section 7](#7-workflow-validation)).
 
@@ -267,7 +267,7 @@ No `Assembly.GetTypes()`, no `Activator.CreateInstance` — fully trim/AOT-safe 
 | Source | `SourceWfs` | `HttpClient` streaming WFS 2.0.0/OGC API Features, `IAsyncEnumerable<T>`. |
 | Sink | `SinkPostGis` | `NpgsqlBinaryImporter` (COPY). **Transactionality is explicit** — see below. |
 | Sink | `SinkGeoJson` | `Utf8JsonWriter` on `FileStream` + GeoJSON4STJ writer. |
-| Sink | `SinkJson` | `Utf8JsonWriter` streaming. |
+| Sink | `SinkJson` | `Utf8JsonWriter` streaming. Writing null/empty values is optional |
 | Sink | `SinkCsv` | `StreamWriter` + `string.Create` allocation-free formatting. |
 | Sink | `SinkExcel` | Streaming zip/OpenXML writer, no full-workbook staging. |
 | Sink | `SinkWfsT` | Batched WFS-T POST inserts/updates over pooled `HttpClient`. |
@@ -329,7 +329,7 @@ Powered by **NetTopologySuite (NTS)**. Streaming blocks are parallelized across 
 | `TransformStringManipulator` | `string.Create`-based casing/trim/pad. |
 | `TransformNullHandler` | Type-safe default substitution. |
 | `TransformAggregator` | **Materializing**, spill-aware group-by (Sum/Avg/Min/Max/Count). Uses a partitioned hash-aggregate, not an unbounded `ConcurrentDictionary`. |
-| `ConditionalSplitter` | **Multi-output.** Routes to named ports by expression rules (AOT-safe evaluator). |
+| `TransformConditionalSplitter` | **Multi-output.** Routes to named ports by expression rules (AOT-safe evaluator). |
 | `TransformValueLookup` | O(1) enrichment from a dictionary loaded at startup. |
 
 ---
@@ -338,7 +338,7 @@ Powered by **NetTopologySuite (NTS)**. Streaming blocks are parallelized across 
 
 Before any I/O, `STRIDE.Core` runs a **fail-fast validation pass**:
 
-1. **Structural:** every `inputs` reference resolves to an existing node/port; no dangling edges; **DAG acyclicity** (topological sort; reject cycles with the offending path).
+1. **Structural:** every `inputs` reference resolves to an existing node/port; no dangling edges; **DAG acyclicity** (topological sort; reject cycles with the offending path); Transfrom blocks and sinks are force to have at least 1 input. Transform block requiring multiple inputs are forced to have the number of required inputs.
 2. **Type registry:** every `type` exists in the source-generated `BlockRegistry`; otherwise `UnknownBlockTypeException` listing valid types.
 3. **Parameters:** required params present and coercible to the target types (validated by generated binders).
 4. **Schema propagation:** `DeriveOutputSchema` is invoked in topological order; type mismatches (e.g., `Calculator` referencing a non-numeric field, sink expecting a geometry column that was removed upstream) fail here with the node id and field name.
@@ -365,7 +365,7 @@ AOT is a **first-class constraint**, applied uniformly. `STRIDE.Cli` sets `<Publ
 | `Npgsql` reflection type mapping | AOT | Explicit type mapper registration at startup; NetTopologySuite plugin configured statically. |
 | `Microsoft.Data.Sqlite` native | Native asset | `SQLitePCLRaw` bundled provider; verified under AOT publish. |
 
-### 8.2 The expression evaluator (Filter/Calculator/ConditionalSplitter)
+### 8.2 The expression evaluator (Filter/Calculator/TransformConditionalSplitter)
 
 A small, sandboxed grammar (comparisons, arithmetic, boolean logic, string ops, null checks, field references). At load time an expression string like `area > 10000 && status == "active"` is parsed into an `IExprNode` tree bound to column ordinals. Evaluation walks the tree against a batch's `ReadOnlySpan` columns — allocation-free on the hot path and fully AOT-compatible. This provides dynamic expression capability without runtime codegen (no Expression Trees / IL emit).
 
@@ -469,21 +469,3 @@ Beyond the `error_log.ndjson` failure record, the engine provides full runtime o
 | 14 | **Sink transactionality vs. error policy** | §5.3 & §10: `writeMode` (Transactional / BatchCommit / file-flush) with defined rollback semantics. |
 | 15 | **True streaming Excel** | §5.3: SAX `OpenXmlReader` source, streaming zip writer sink (no DOM staging). |
 | 16 | **Schema propagation** | §5.1 & §7: `DeriveOutputSchema` propagated and validated in topological order. |
-
----
-
-## Appendix B — System Prompt for the Coding Agent
-
-> "You are a Principal .NET Engineer specializing in high-performance, AOT-compiled data processing. Build a streaming spatial ETL engine, 'STRIDE', in .NET 10 / C# 14.
->
-> **Non-negotiable constraints:**
-> 1. Solution layout: `STRIDE.Abstractions` (contracts only), `STRIDE.Core` (orchestrator, DAG validator, SpillManager, SecretResolver, metrics), `STRIDE.Schema` (typed YAML + AOT-safe loader), `STRIDE.Blocks` (implementations, references Abstractions only), `STRIDE.SourceGen` (Roslyn generator emitting the block registry), `STRIDE.Cli` (Native AOT). One xUnit project per production project, ≥ 80% coverage.
-> 2. **Zero runtime code generation / reflection.** No `Expression.Compile`, no assembly scanning, no reflection-based (de)serialization. Use a precompiled expression evaluator, `[GeneratedRegex]`, source-generated block registry + param binders, `JsonSerializerContext`, and an AOT-safe YAML loader. CI must fail on any `IL2xxx`/`IL3xxx` warning.
-> 3. Data flows as **immutable, Arrow-aligned columnar `IRecordBatch`es** with a `Schema`; primitives are `unmanaged` spans, strings are UTF-8 offset+blob, buffers are pooled. No `Dictionary<string,object>` records.
-> 4. The pipeline is a **validated DAG**: nodes with `id`, edges via named input ports, multi-input (SpatialJoin) and multi-output (ConditionalSplitter) blocks, multiple sinks. Validate structure, acyclicity, block types, params, schema propagation, and CRS codes before any I/O.
-> 5. Classify blocks as **Streaming** or **Materializing**; materializing blocks are spill-aware via `SpillManager` (MemoryMappedFiles over Arrow) — never unbounded in memory.
-> 6. Connect blocks with **bounded** `System.Threading.Channels` for backpressure. Parallelize streaming blocks across immutable batches with bounded `Parallel.ForEachAsync`; build spatial indexes single-threaded then freeze before concurrent query; use per-worker `GeometryFactory`.
-> 7. `SecretResolver` resolves `${VAR}` on the **parsed YAML node graph** (scalar-only), fail-fast on missing variables.
-> 8. Implement `ErrorPolicy` (`StopPipeline`/`StopBranch`/`Ignore`) with defined sink transactionality (`writeMode`).
-> 9. Use `NetTopologySuite` for geometry and `NetTopologySuite.IO.GeoJSON4STJ` for GeoJSON. Default reprojection via managed `ProjNet` to preserve single-file AOT.
-> 10. Provide structured logging, per-node metrics, progress, linked cancellation, and optional source checkpoint/resume."

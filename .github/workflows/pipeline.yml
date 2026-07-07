@@ -1,0 +1,124 @@
+name: STRIDE Pipeline
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  pr-validation:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Format check
+        run: dotnet format STRIDE.slnx --verify-no-changes
+
+      - name: Build
+        run: dotnet build STRIDE.slnx -c Release /warnaserror
+
+      - name: Test with coverage
+        run: dotnet test STRIDE.slnx -c Release --collect:"XPlat Code Coverage" --results-directory TestResults
+
+      - name: Install reportgenerator
+        run: dotnet tool install --global dotnet-reportgenerator-globaltool
+
+      - name: Coverage gate 80%
+        shell: pwsh
+        run: |
+          reportgenerator -reports:'TestResults/**/coverage.cobertura.xml' -targetdir:'TestResults/CoverageReport' -reporttypes:'JsonSummary'
+          $summary = Get-Content 'TestResults/CoverageReport/Summary.json' | ConvertFrom-Json
+          $lineCoverage = [double]$summary.summary.linecoverage
+          Write-Host "Line coverage: $lineCoverage%"
+          if ($lineCoverage -lt 80) {
+            throw "Coverage gate failed. Required >= 80, actual $lineCoverage"
+          }
+
+      - name: AOT smoke publish
+        run: dotnet publish src/STRIDE.Cli/STRIDE.Cli.csproj -c Release -r linux-x64 /p:PublishAot=true /p:PublishSingleFile=true
+
+      - name: AOT runtime self-test
+        run: ./src/STRIDE.Cli/bin/Release/net10.0/linux-x64/publish/STRIDE.Cli ./test-workflow.yaml
+
+  release-build:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            rid: linux-x64
+            binary: STRIDE.Cli
+          - os: windows-latest
+            rid: win-x64
+            binary: STRIDE.Cli.exe
+          - os: macos-13
+            rid: osx-x64
+            binary: STRIDE.Cli
+          - os: macos-14
+            rid: osx-arm64
+            binary: STRIDE.Cli
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Build
+        run: dotnet build STRIDE.slnx -c Release /warnaserror
+
+      - name: Test
+        run: dotnet test STRIDE.slnx -c Release
+
+      - name: Publish AOT
+        run: dotnet publish src/STRIDE.Cli/STRIDE.Cli.csproj -c Release -r ${{ matrix.rid }} /p:PublishAot=true /p:PublishSingleFile=true
+
+      - name: Runtime self-test
+        shell: pwsh
+        run: |
+          $binary = "src/STRIDE.Cli/bin/Release/net10.0/${{ matrix.rid }}/publish/${{ matrix.binary }}"
+          & $binary "./test-workflow.yaml"
+
+      - name: Stage release asset
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          $src = "src/STRIDE.Cli/bin/Release/net10.0/${{ matrix.rid }}/publish/${{ matrix.binary }}"
+          $dest = "release/STRIDE-${{ matrix.rid }}${{ endsWith(matrix.binary, '.exe') && '.exe' || '' }}"
+          Copy-Item $src $dest -Force
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stride-${{ matrix.rid }}
+          path: release/*
+
+  release-assets:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: release-build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: stride-main-${{ github.run_number }}
+          name: STRIDE main ${{ github.run_number }}
+          generate_release_notes: true
+          files: release-artifacts/**/*

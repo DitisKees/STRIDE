@@ -1,192 +1,386 @@
-using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Channels;
-using System.Threading.Tasks;
-using Microsoft.Extensions.Logging;
 using STRIDE.Abstractions;
 using STRIDE.Schema;
-using STRIDE.Blocks;
+using System.Threading.Channels;
 
 namespace STRIDE.Core;
 
-public sealed class PipelineRunner(WorkflowConfig config, ILogger<PipelineRunner> logger)
+public sealed class PipelineRunner
 {
-    private readonly ConcurrentDictionary<string, Channel<IRecordBatch>> _nodeChannels = new(StringComparer.Ordinal);
-    private readonly CancellationTokenSource _cts = new();
+    private readonly DagValidator _validator = new();
 
-    public async Task ExecuteAsync()
+    public Task<int> RunAsync(CancellationToken cancellationToken)
     {
-        // 1. Valideer de structuur en bepaal de topologische volgorde
-        var validator = new DagValidator(config);
-        List<string> executionOrder;
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(0);
+    }
+
+    public async Task<int> RunAsync(
+        WorkflowDefinition workflow,
+        IBlockFactory blockFactory,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(workflow);
+        ArgumentNullException.ThrowIfNull(blockFactory);
+
+        var validation = _validator.Validate(workflow, blockFactory);
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        using var spillManager = new SpillManager(workflow.Settings.SpillDirectory);
+        using var metrics = new ProgressMetricsSink();
+        await using var errors = new NdjsonErrorSink(workflow.Settings.ErrorLog);
+
+        var inputsByNode = new Dictionary<string, Dictionary<string, ChannelReader<IRecordBatch>>>(StringComparer.Ordinal);
+        var outputsByNode = new Dictionary<string, Dictionary<string, ChannelWriter<IRecordBatch>>>(StringComparer.Ordinal);
+
+        foreach (var nodeId in validation.NodeById.Keys)
+        {
+            inputsByNode[nodeId] = new Dictionary<string, ChannelReader<IRecordBatch>>(StringComparer.OrdinalIgnoreCase);
+            outputsByNode[nodeId] = new Dictionary<string, ChannelWriter<IRecordBatch>>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var outputPortWriters = new Dictionary<(string NodeId, string Port), List<ChannelWriter<IRecordBatch>>>();
+
+        foreach (var node in validation.NodeById.Values)
+        {
+            foreach (var input in validation.Inputs[node.Id])
+            {
+                var channel = Channel.CreateBounded<IRecordBatch>(new BoundedChannelOptions(workflow.Settings.BatchSize)
+                {
+                    FullMode = BoundedChannelFullMode.Wait,
+                    SingleReader = false,
+                    SingleWriter = false,
+                });
+
+                inputsByNode[node.Id][input.Key] = channel.Reader;
+
+                var key = (input.Value.UpstreamNodeId, input.Value.UpstreamPort);
+                if (!outputPortWriters.TryGetValue(key, out var writers))
+                {
+                    writers = [];
+                    outputPortWriters[key] = writers;
+                }
+
+                writers.Add(channel.Writer);
+            }
+        }
+
+        foreach (var entry in outputPortWriters)
+        {
+            outputsByNode[entry.Key.NodeId][entry.Key.Port] =
+                entry.Value.Count == 1
+                    ? entry.Value[0]
+                    : new BroadcastChannelWriter(entry.Value);
+        }
+
+        var blockInstances = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach (var node in validation.NodeById.Values)
+        {
+            blockInstances[node.Id] = blockFactory.Create(node.Type, BlockParams.FromStringMap(node.Params));
+        }
+
+        var tasks = new List<Task>(validation.NodeById.Count);
+        foreach (var nodeId in validation.TopologicalOrder)
+        {
+            var node = validation.NodeById[nodeId];
+            var meteredInputs = inputsByNode[node.Id].ToDictionary(
+                static kvp => kvp.Key,
+                kvp => (ChannelReader<IRecordBatch>)new MeteredChannelReader(node.Id, kvp.Value, metrics),
+                StringComparer.OrdinalIgnoreCase);
+
+            var meteredOutputs = outputsByNode[node.Id].ToDictionary(
+                static kvp => kvp.Key,
+                kvp => (ChannelWriter<IRecordBatch>)new MeteredChannelWriter(node.Id, kvp.Key, kvp.Value, metrics),
+                StringComparer.OrdinalIgnoreCase);
+
+            var context = new BlockContext(
+                node.Id,
+                meteredInputs,
+                meteredOutputs,
+                spillManager,
+                metrics,
+                errors,
+                node.ErrorPolicy,
+                BlockParams.FromStringMap(node.Params),
+                linkedCts.Token);
+
+            var instance = blockInstances[nodeId];
+            tasks.Add(instance switch
+            {
+                ISourceBlock source => RunSourceAsync(source, context, linkedCts),
+                ITransformBlock transform => RunTransformAsync(transform, context, linkedCts),
+                ISinkBlock sink => RunSinkAsync(sink, context, linkedCts),
+                _ => Task.FromException(new InvalidOperationException($"Node '{node.Id}' has unsupported block type '{node.Type}'.")),
+            });
+        }
+
         try
         {
-            executionOrder = validator.ValidateAndDetermineOrder();
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            return 0;
         }
-        catch (Exception ex)
+        catch
         {
-            logger.LogError("Validatiefout bij het opbouwen van de DAG: {Message}", ex.Message);
-            throw;
-        }
-
-        logger.LogInformation("Workflow succesvol gevalideerd. Starten van {Count} verwerkingsstations.", executionOrder.Count);
-
-        // 2. Initialiseer onbeperkte kanalen voor vloeibare doorstroom tijdens benchmarks
-        var channelOptions = new BoundedChannelOptions(32)
-        {
-            FullMode = BoundedChannelFullMode.Wait, // Wacht netjes als de buffer vol is (Backpressure!)
-            SingleWriter = false,                  // Sommige blokken kunnen parallel schrijven
-            SingleReader = true                    // Elk kanaal wordt door exact één opvolger leeggehaald
-        };
-
-        foreach (var nodeId in executionOrder)
-        {
-            _nodeChannels[nodeId] = Channel.CreateBounded<IRecordBatch>(channelOptions);
-        }
-
-        var tasks = new List<Task>();
-        var ct = _cts.Token;
-
-        // 3. Lanceer alle nodes onafhankelijk van elkaar op de ThreadPool via Task.Run
-        foreach (var node in config.Nodes)
-        {
-            tasks.Add(Task.Run(async () => await RunNodeAsync(node, ct), ct));
-        }
-
-        foreach (var sink in config.Sinks)
-        {
-            tasks.Add(Task.Run(async () => await RunSinkNodeAsync(sink, ct), ct));
-        }
-
-        // Geef de TPL een microseconde de tijd om de taken daadwerkelijk te spinnen
-        await Task.Yield();
-
-        try
-        {
-            await Task.WhenAll(tasks);
-            logger.LogInformation("Pipeline succesvol afgerond.");
-        }
-        catch (OperationCanceledException)
-        {
-            logger.LogWarning("Pipeline-afbreek-signaal verwerkt. Alle stations zijn succesvol leeggepompt.");
-        }
-        catch (Exception ex)
-        {
-            logger.LogCritical(ex, "Kritieke fout tijdens pipeline uitvoering.");
+            linkedCts.Cancel();
             throw;
         }
     }
 
-    private async Task RunNodeAsync(WorkflowNode node, CancellationToken ct)
+    private static async Task RunSourceAsync(
+        ISourceBlock source,
+        BlockContext context,
+        CancellationTokenSource cancellationTokenSource)
+    {
+        Exception? completionException = null;
+
+        try
+        {
+            await foreach (var batch in source.ExecuteAsync(context, context.CancellationToken).ConfigureAwait(false))
+            {
+                await WriteDefaultOutputAsync(context, batch, context.CancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            completionException = HandleBlockException(ex, context, cancellationTokenSource);
+            if (completionException is not null)
+            {
+                throw completionException;
+            }
+        }
+        finally
+        {
+            CompleteOutputs(context, completionException);
+        }
+    }
+
+    private static async Task RunTransformAsync(
+        ITransformBlock transform,
+        BlockContext context,
+        CancellationTokenSource cancellationTokenSource)
+    {
+        Exception? completionException = null;
+
+        try
+        {
+            await foreach (var batch in transform.ExecuteAsync(context, context.CancellationToken).ConfigureAwait(false))
+            {
+                await WriteDefaultOutputAsync(context, batch, context.CancellationToken).ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            completionException = HandleBlockException(ex, context, cancellationTokenSource);
+            if (completionException is not null)
+            {
+                throw completionException;
+            }
+        }
+        finally
+        {
+            CompleteOutputs(context, completionException);
+        }
+    }
+
+    private static async Task RunSinkAsync(
+        ISinkBlock sink,
+        BlockContext context,
+        CancellationTokenSource cancellationTokenSource)
     {
         try
         {
-            // Genereer het blok via de compile-time registry (AOT veilig)
-            var block = BlockRegistry.CreateBlock(node.Type, node.Params);
-
-            var policy = node.ErrorPolicy?.ToLowerInvariant() switch
+            await sink.ExecuteAsync(context, context.CancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            if (ex is OperationCanceledException && context.CancellationToken.IsCancellationRequested)
             {
-                "stopbranch" => ErrorPolicy.StopBranch,
-                "ignore" => ErrorPolicy.Ignore,
-                _ => ErrorPolicy.StopPipeline
-            };
-
-            var ctx = new BlockContext(node.Id, policy, (msg, ex) => logger.LogError(ex, "[{NodeId}]: {Msg}", node.Id, msg));
-            var outputWriter = _nodeChannels[node.Id].Writer;
-
-            // Scenario A: Het is een BRON blok (Gegenereerde datastroom / File Reader)
-            if (block is ISourceBlock sourceBlock)
-            {
-                await foreach (var batch in sourceBlock.StreamAsync(ctx, ct).WithCancellation(ct))
-                {
-                    await outputWriter.WriteAsync(batch, ct);
-                }
-                outputWriter.TryComplete();
                 return;
             }
 
-            // Scenario B: Het is een TRANSFORMATIE blok
-            if (block is ITransformBlock transformBlock)
+            var completionException = HandleBlockException(ex, context, cancellationTokenSource);
+            if (completionException is not null)
             {
-                var inputStreams = new Dictionary<string, IAsyncEnumerable<IRecordBatch>>(StringComparer.Ordinal);
-                if (node.Inputs != null)
-                {
-                    foreach (var input in node.Inputs)
-                    {
-                        string upstreamNodeId = input.Value.Split(':')[0];
-                        inputStreams[input.Key] = _nodeChannels[upstreamNodeId].Reader.ReadAllAsync(ct);
-                    }
-                }
-
-                await foreach (var batch in transformBlock.ExecuteAsync(inputStreams, ctx, ct).WithCancellation(ct))
-                {
-                    await outputWriter.WriteAsync(batch, ct);
-                }
-                outputWriter.TryComplete();
+                throw completionException;
             }
-        }
-        catch (OperationCanceledException)
-        {
-            // Doorgeschoten vanuit yield break of WriteAsync, gracieus afsluiten
-            _nodeChannels[node.Id].Writer.TryComplete();
-        }
-        catch (Exception ex)
-        {
-            logger.LogError(ex, "Fout in verwerkings-node '{Id}'. Pipeline wordt stilgelegd.", node.Id);
-            _cts.Cancel();
-            _nodeChannels[node.Id].Writer.TryComplete(ex);
-            throw;
         }
     }
 
-    private async Task RunSinkNodeAsync(WorkflowSink sink, CancellationToken ct)
+    private static Exception? HandleBlockException(
+        Exception ex,
+        BlockContext context,
+        CancellationTokenSource cancellationTokenSource)
     {
-        try
+        context.Metrics.OnError(context.NodeId);
+
+        if (context.ErrorPolicy == ErrorPolicy.Ignore)
         {
-            if (sink.Inputs == null || !sink.Inputs.TryGetValue("in", out var upstreamMapping))
-            {
-                throw new InvalidOperationException($"Sink '{sink.Id}' mist een geldige 'in' invoerkoppeling.");
-            }
+            context.Errors.WriteRecordErrorAsync(context.NodeId, ex.Message, context.CancellationToken).GetAwaiter().GetResult();
+            return null;
+        }
 
-            string upstreamNodeId = upstreamMapping.Split(':')[0];
-            var inputStream = _nodeChannels[upstreamNodeId].Reader.ReadAllAsync(ct);
+        if (context.ErrorPolicy == ErrorPolicy.StopBranch)
+        {
+            return null;
+        }
 
-            try
-            {
-                var sinkBlock = BlockRegistry.CreateBlock(sink.Type, sink.Params);
-                if (sinkBlock is ISinkBlock concreteSink)
-                {
-                    var ctx = new BlockContext(sink.Id, ErrorPolicy.StopPipeline, (msg, ex) => logger.LogError(ex, "[{NodeId}]: {Msg}", sink.Id, msg));
-                    await concreteSink.WriteAsync(inputStream, ctx, ct);
-                    return;
-                }
-            }
-            catch (KeyNotFoundException)
-            {
-                // Fallback voor onze test NullSink/fictieve sinks
-                logger.LogInformation("Sink '{Id}' ({Type}) activeert NullSink modus. Stream wordt leeggetrokken.", sink.Id, sink.Type);
+        cancellationTokenSource.Cancel();
+        return ex;
+    }
 
-                long totalRowsDropped = 0;
-                await foreach (var batch in inputStream.WithCancellation(ct))
-                {
-                    totalRowsDropped += batch.RowCount;
-                    batch.Dispose(); // Geef ArrayPool geheugen direct vrij!
-                }
-                logger.LogInformation("Sink '{Id}' succesvol afgerond. {Count} records verwerkt.", sink.Id, totalRowsDropped);
+    private static async ValueTask WriteDefaultOutputAsync(
+        BlockContext context,
+        IRecordBatch batch,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Outputs.TryGetValue("out", out var output))
+        {
+            return;
+        }
+
+        await output.WriteAsync(batch, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void CompleteOutputs(BlockContext context, Exception? completionException)
+    {
+        foreach (var output in context.Outputs.Values)
+        {
+            output.TryComplete(completionException);
+        }
+    }
+}
+
+internal sealed class BroadcastChannelWriter : ChannelWriter<IRecordBatch>
+{
+    private readonly IReadOnlyList<ChannelWriter<IRecordBatch>> _writers;
+
+    public BroadcastChannelWriter(IReadOnlyList<ChannelWriter<IRecordBatch>> writers)
+    {
+        _writers = writers;
+    }
+
+    public override bool TryComplete(Exception? error = null)
+    {
+        var success = true;
+        foreach (var writer in _writers)
+        {
+            success &= writer.TryComplete(error);
+        }
+
+        return success;
+    }
+
+    public override bool TryWrite(IRecordBatch item)
+    {
+        var success = true;
+        foreach (var writer in _writers)
+        {
+            success &= writer.TryWrite(item);
+        }
+
+        return success;
+    }
+
+    public override async ValueTask<bool> WaitToWriteAsync(CancellationToken cancellationToken = default)
+    {
+        foreach (var writer in _writers)
+        {
+            if (!await writer.WaitToWriteAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return false;
             }
         }
-        catch (OperationCanceledException)
+
+        return true;
+    }
+
+    public override ValueTask WriteAsync(IRecordBatch item, CancellationToken cancellationToken = default)
+        => new(Task.WhenAll(_writers.Select(w => w.WriteAsync(item, cancellationToken).AsTask())));
+}
+
+internal sealed class MeteredChannelReader : ChannelReader<IRecordBatch>
+{
+    private readonly string _nodeId;
+    private readonly ChannelReader<IRecordBatch> _inner;
+    private readonly IBlockMetricsSink _metrics;
+
+    public MeteredChannelReader(string nodeId, ChannelReader<IRecordBatch> inner, IBlockMetricsSink metrics)
+    {
+        _nodeId = nodeId;
+        _inner = inner;
+        _metrics = metrics;
+    }
+
+    public override Task Completion => _inner.Completion;
+
+    public override bool TryPeek(out IRecordBatch item)
+    {
+        if (_inner.TryPeek(out var candidate))
         {
-            // Geabsorbeerd bij Ctrl+C
+            item = candidate;
+            return true;
         }
-        catch (Exception ex)
+
+        item = null!;
+        return false;
+    }
+
+    public override bool TryRead(out IRecordBatch item)
+    {
+        if (_inner.TryRead(out var candidate))
         {
-            logger.LogError(ex, "Kritieke fout in sink-node '{Id}'.", sink.Id);
-            _cts.Cancel();
-            throw;
+            item = candidate;
+            _metrics.OnBatchIn(_nodeId, item.RowCount, 0);
+            return true;
         }
+
+        item = null!;
+        return false;
+    }
+
+    public override ValueTask<bool> WaitToReadAsync(CancellationToken cancellationToken = default)
+        => _inner.WaitToReadAsync(cancellationToken);
+}
+
+internal sealed class MeteredChannelWriter : ChannelWriter<IRecordBatch>
+{
+    private readonly string _nodeId;
+    private readonly string _port;
+    private readonly ChannelWriter<IRecordBatch> _inner;
+    private readonly IBlockMetricsSink _metrics;
+
+    public MeteredChannelWriter(string nodeId, string port, ChannelWriter<IRecordBatch> inner, IBlockMetricsSink metrics)
+    {
+        _nodeId = nodeId;
+        _port = port;
+        _inner = inner;
+        _metrics = metrics;
+    }
+
+    public override bool TryComplete(Exception? error = null)
+        => _inner.TryComplete(error);
+
+    public override bool TryWrite(IRecordBatch item)
+    {
+        if (_inner.TryWrite(item))
+        {
+            Track(item);
+            return true;
+        }
+
+        return false;
+    }
+
+    public override ValueTask<bool> WaitToWriteAsync(CancellationToken cancellationToken = default)
+        => _inner.WaitToWriteAsync(cancellationToken);
+
+    public override async ValueTask WriteAsync(IRecordBatch item, CancellationToken cancellationToken = default)
+    {
+        await _inner.WriteAsync(item, cancellationToken).ConfigureAwait(false);
+        Track(item);
+    }
+
+    private void Track(IRecordBatch batch)
+    {
+        _metrics.OnBatchOut(_nodeId, batch.RowCount, 0);
     }
 }

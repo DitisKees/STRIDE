@@ -1,10 +1,30 @@
-**/bin
-**/obj
-**/output 
+# Build outputs
+bin/
+obj/
+out/
+artifacts/
 
-*.yaml
-.idea
-*.bak
-*.backup
+# Test and coverage output
+TestResults/
+coverage/
+*.coverage
+*.coveragexml
 
-*.log
+# Local runtime artifacts
+output/
+.stride-spill/
+
+# User and IDE settings
+.vs/
+.vscode/
+*.user
+*.suo
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+
+# OS files
+.DS_Store
+Thumbs.db
