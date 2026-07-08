@@ -1,0 +1,13 @@
+{
+    "hooks": {
+        "Stop": [
+            {
+                "type": "command",
+                "timeout": 1800,
+                "windows": "$changed = git status --porcelain -- src tests Directory.Build.props global.json; if ($LASTEXITCODE -ne 0) { exit 0 }; if ([string]::IsNullOrWhiteSpace(($changed -join ''))) { Write-Output 'dotnet-quality-skip: no src/tests changes'; exit 0 }; dotnet build STRIDE.slnx -v minimal; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; dotnet test STRIDE.slnx --no-build -v minimal; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+                "linux": "CHANGED=\"$(git status --porcelain -- src tests Directory.Build.props global.json 2>/dev/null)\"; if [ -z \"$CHANGED\" ]; then echo 'dotnet-quality-skip: no src/tests changes'; exit 0; fi; dotnet build STRIDE.slnx -v minimal && dotnet test STRIDE.slnx --no-build -v minimal",
+                "osx": "CHANGED=\"$(git status --porcelain -- src tests Directory.Build.props global.json 2>/dev/null)\"; if [ -z \"$CHANGED\" ]; then echo 'dotnet-quality-skip: no src/tests changes'; exit 0; fi; dotnet build STRIDE.slnx -v minimal && dotnet test STRIDE.slnx --no-build -v minimal"
+            }
+        ]
+    }
+}

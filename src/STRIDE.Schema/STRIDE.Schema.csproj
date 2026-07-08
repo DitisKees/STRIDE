@@ -2,7 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\STRIDE.Abstractions\STRIDE.Abstractions.csproj" />
-    <PackageReference Include="YamlDotNet" Version="16.3.0" />
+    <PackageReference Include="YamlDotNet" Version="18.1.0" />
   </ItemGroup>
 
   <PropertyGroup>

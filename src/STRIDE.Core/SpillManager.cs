@@ -6,6 +6,9 @@ namespace STRIDE.Core;
 public sealed class SpillManager : ISpillManager, IDisposable
 {
     private readonly string _rootDirectory;
+    private readonly string _runDirectory;
+    private readonly string _runLockFilePath;
+    private readonly FileStream _runLockFileStream;
     private readonly ConcurrentDictionary<string, SpillScope> _scopes = new(StringComparer.Ordinal);
     private int _isDisposed;
 
@@ -13,6 +16,14 @@ public sealed class SpillManager : ISpillManager, IDisposable
     {
         _rootDirectory = Path.GetFullPath(string.IsNullOrWhiteSpace(rootDirectory) ? "./.stride-spill" : rootDirectory);
         Directory.CreateDirectory(_rootDirectory);
+
+        _runDirectory = Path.Combine(_rootDirectory, $"run-{DateTime.UtcNow:yyyyMMddHHmmss}-{Guid.NewGuid():N}");
+        _runLockFilePath = Path.Combine(_runDirectory, ".active");
+
+        CleanupOrphanedRunDirectories();
+        Directory.CreateDirectory(_runDirectory);
+        _runLockFileStream = new FileStream(_runLockFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.None);
+
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
     }
 
@@ -23,7 +34,7 @@ public sealed class SpillManager : ISpillManager, IDisposable
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _isDisposed) != 0, this);
 
         var safeBlockId = string.Concat(blockId.Select(static ch => Path.GetInvalidFileNameChars().Contains(ch) ? '_' : ch));
-        var scopeDirectory = Path.Combine(_rootDirectory, $"{safeBlockId}-{Guid.NewGuid():N}");
+        var scopeDirectory = Path.Combine(_runDirectory, $"{safeBlockId}-{Guid.NewGuid():N}");
         Directory.CreateDirectory(scopeDirectory);
 
         var scope = new SpillScope(scopeDirectory, RemoveScope);
@@ -56,6 +67,59 @@ public sealed class SpillManager : ISpillManager, IDisposable
         }
 
         _scopes.Clear();
+
+        try
+        {
+            _runLockFileStream.Dispose();
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
+
+        TryDeleteDirectory(_runDirectory);
+    }
+
+    private void CleanupOrphanedRunDirectories()
+    {
+        foreach (var runDirectory in Directory.EnumerateDirectories(_rootDirectory, "run-*", SearchOption.TopDirectoryOnly))
+        {
+            if (string.Equals(runDirectory, _runDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var activeMarkerPath = Path.Combine(runDirectory, ".active");
+
+            try
+            {
+                if (File.Exists(activeMarkerPath))
+                {
+                    using var _ = new FileStream(activeMarkerPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+                }
+
+                TryDeleteDirectory(runDirectory);
+            }
+            catch
+            {
+                // Another process likely owns this run directory.
+            }
+        }
+    }
+
+    private static void TryDeleteDirectory(string directoryPath)
+    {
+        try
+        {
+            if (Directory.Exists(directoryPath))
+            {
+                Directory.Delete(directoryPath, recursive: true);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
     }
 }
 
@@ -79,7 +143,27 @@ internal sealed class SpillScope : ISpillScope
 
         var index = Interlocked.Increment(ref _nextPayloadIndex);
         var filePath = Path.Combine(_scopeDirectory, $"spill-{index:D8}.bin");
-        await File.WriteAllBytesAsync(filePath, payload.ToArray(), cancellationToken).ConfigureAwait(false);
+
+        if (payload.Length == 0)
+        {
+            await File.WriteAllBytesAsync(filePath, [], cancellationToken).ConfigureAwait(false);
+            return filePath;
+        }
+
+        await using (var stream = new FileStream(
+            filePath,
+            new FileStreamOptions
+            {
+                Mode = FileMode.Create,
+                Access = FileAccess.ReadWrite,
+                Share = FileShare.Read,
+                Options = FileOptions.Asynchronous,
+            }))
+        {
+            await stream.WriteAsync(payload, cancellationToken).ConfigureAwait(false);
+            await stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         return filePath;
     }
 
@@ -101,8 +185,51 @@ internal sealed class SpillScope : ISpillScope
         foreach (var file in files)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var bytes = await File.ReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false);
+
+            var fileLength = new FileInfo(file).Length;
+            if (fileLength == 0)
+            {
+                yield return ReadOnlyMemory<byte>.Empty;
+                continue;
+            }
+
+            if (fileLength > int.MaxValue)
+            {
+                throw new InvalidOperationException($"Spill payload '{file}' is too large to read into memory ({fileLength} bytes).");
+            }
+
+            var bytes = GC.AllocateUninitializedArray<byte>((int)fileLength);
+            await using (var stream = new FileStream(
+                file,
+                new FileStreamOptions
+                {
+                    Mode = FileMode.Open,
+                    Access = FileAccess.Read,
+                    Share = FileShare.Read,
+                    Options = FileOptions.Asynchronous | FileOptions.SequentialScan,
+                }))
+            {
+                var bytesRead = 0;
+                while (bytesRead < bytes.Length)
+                {
+                    var read = await stream.ReadAsync(bytes.AsMemory(bytesRead), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    bytesRead += read;
+                }
+
+                if (bytesRead != bytes.Length)
+                {
+                    Array.Resize(ref bytes, bytesRead);
+                }
+            }
+
             yield return bytes;
+
+            await Task.Yield();
         }
     }
 

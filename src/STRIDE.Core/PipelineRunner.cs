@@ -1,5 +1,7 @@
 using STRIDE.Abstractions;
 using STRIDE.Schema;
+using Microsoft.Extensions.Logging;
+using System.Globalization;
 using System.Threading.Channels;
 
 namespace STRIDE.Core;
@@ -18,15 +20,34 @@ public sealed class PipelineRunner
         WorkflowDefinition workflow,
         IBlockFactory blockFactory,
         CancellationToken cancellationToken)
+        => await RunAsync(workflow, blockFactory, cancellationToken, cancellationToken).ConfigureAwait(false);
+
+    public async Task<int> RunAsync(
+        WorkflowDefinition workflow,
+        IBlockFactory blockFactory,
+        CancellationToken drainCancellationToken,
+        CancellationToken abortCancellationToken)
     {
         ArgumentNullException.ThrowIfNull(workflow);
         ArgumentNullException.ThrowIfNull(blockFactory);
 
         var validation = _validator.Validate(workflow, blockFactory);
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        using var loggerFactory = LoggerFactory.Create(static builder =>
+        {
+            builder.SetMinimumLevel(LogLevel.Information);
+            builder.AddJsonConsole(options =>
+            {
+                options.IncludeScopes = true;
+            });
+        });
+
+        using var executionCts = CancellationTokenSource.CreateLinkedTokenSource(abortCancellationToken);
+        using var sourceCts = CancellationTokenSource.CreateLinkedTokenSource(drainCancellationToken, executionCts.Token);
+        using var drainEscalationRegistration = RegisterDrainEscalation(drainCancellationToken, workflow.Settings.DrainTimeoutSeconds, executionCts);
 
         using var spillManager = new SpillManager(workflow.Settings.SpillDirectory);
-        using var metrics = new ProgressMetricsSink();
+        using var metrics = new ProgressMetricsSink(loggerFactory.CreateLogger<ProgressMetricsSink>());
         await using var errors = new NdjsonErrorSink(workflow.Settings.ErrorLog);
 
         var inputsByNode = new Dictionary<string, Dictionary<string, ChannelReader<IRecordBatch>>>(StringComparer.Ordinal);
@@ -73,9 +94,12 @@ public sealed class PipelineRunner
         }
 
         var blockInstances = new Dictionary<string, object>(StringComparer.Ordinal);
+        var parametersByNode = new Dictionary<string, BlockParams>(StringComparer.Ordinal);
         foreach (var node in validation.NodeById.Values)
         {
-            blockInstances[node.Id] = blockFactory.Create(node.Type, BlockParams.FromStringMap(node.Params));
+            var parameters = CreateEffectiveParameters(workflow.Settings, node.Params);
+            parametersByNode[node.Id] = parameters;
+            blockInstances[node.Id] = blockFactory.Create(node.Type, parameters);
         }
 
         var tasks = new List<Task>(validation.NodeById.Count);
@@ -92,6 +116,8 @@ public sealed class PipelineRunner
                 kvp => (ChannelWriter<IRecordBatch>)new MeteredChannelWriter(node.Id, kvp.Key, kvp.Value, metrics),
                 StringComparer.OrdinalIgnoreCase);
 
+            var instance = blockInstances[nodeId];
+
             var context = new BlockContext(
                 node.Id,
                 meteredInputs,
@@ -100,15 +126,14 @@ public sealed class PipelineRunner
                 metrics,
                 errors,
                 node.ErrorPolicy,
-                BlockParams.FromStringMap(node.Params),
-                linkedCts.Token);
+                parametersByNode[node.Id],
+                instance is ISourceBlock ? sourceCts.Token : executionCts.Token);
 
-            var instance = blockInstances[nodeId];
             tasks.Add(instance switch
             {
-                ISourceBlock source => RunSourceAsync(source, context, linkedCts),
-                ITransformBlock transform => RunTransformAsync(transform, context, linkedCts),
-                ISinkBlock sink => RunSinkAsync(sink, context, linkedCts),
+                ISourceBlock source => RunSourceAsync(source, context, executionCts),
+                ITransformBlock transform => RunTransformAsync(transform, context, executionCts),
+                ISinkBlock sink => RunSinkAsync(sink, context, executionCts),
                 _ => Task.FromException(new InvalidOperationException($"Node '{node.Id}' has unsupported block type '{node.Type}'.")),
             });
         }
@@ -120,7 +145,7 @@ public sealed class PipelineRunner
         }
         catch
         {
-            linkedCts.Cancel();
+            executionCts.Cancel();
             throw;
         }
     }
@@ -139,10 +164,18 @@ public sealed class PipelineRunner
                 await WriteDefaultOutputAsync(context, batch, context.CancellationToken).ConfigureAwait(false);
             }
         }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            completionException = null;
+        }
+        catch (Exception ex) when (IsBranchStoppedSignal(ex))
+        {
+            completionException = AsBranchStoppedException(ex, context.NodeId);
+        }
         catch (Exception ex)
         {
             completionException = HandleBlockException(ex, context, cancellationTokenSource);
-            if (completionException is not null)
+            if (completionException is not null && completionException is not BranchStoppedException)
             {
                 throw completionException;
             }
@@ -167,10 +200,18 @@ public sealed class PipelineRunner
                 await WriteDefaultOutputAsync(context, batch, context.CancellationToken).ConfigureAwait(false);
             }
         }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            completionException = null;
+        }
+        catch (Exception ex) when (IsBranchStoppedSignal(ex))
+        {
+            completionException = AsBranchStoppedException(ex, context.NodeId);
+        }
         catch (Exception ex)
         {
             completionException = HandleBlockException(ex, context, cancellationTokenSource);
-            if (completionException is not null)
+            if (completionException is not null && completionException is not BranchStoppedException)
             {
                 throw completionException;
             }
@@ -193,6 +234,11 @@ public sealed class PipelineRunner
         catch (Exception ex)
         {
             if (ex is OperationCanceledException && context.CancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (IsBranchStoppedSignal(ex))
             {
                 return;
             }
@@ -220,7 +266,7 @@ public sealed class PipelineRunner
 
         if (context.ErrorPolicy == ErrorPolicy.StopBranch)
         {
-            return null;
+            return new BranchStoppedException(context.NodeId, ex.Message, ex);
         }
 
         cancellationTokenSource.Cancel();
@@ -246,6 +292,117 @@ public sealed class PipelineRunner
         {
             output.TryComplete(completionException);
         }
+    }
+
+    private static bool IsBranchStoppedSignal(Exception exception)
+    {
+        if (exception is BranchStoppedException)
+        {
+            return true;
+        }
+
+        return exception is ChannelClosedException channelClosed
+            && channelClosed.InnerException is BranchStoppedException;
+    }
+
+    private static BranchStoppedException AsBranchStoppedException(Exception exception, string nodeId)
+    {
+        if (exception is BranchStoppedException direct)
+        {
+            return direct;
+        }
+
+        if (exception is ChannelClosedException channelClosed
+            && channelClosed.InnerException is BranchStoppedException wrapped)
+        {
+            return wrapped;
+        }
+
+        return new BranchStoppedException(nodeId, exception.Message, exception);
+    }
+
+    private static BlockParams CreateEffectiveParameters(
+        WorkflowSettings settings,
+        IReadOnlyDictionary<string, string> nodeParameters)
+    {
+        var values = new Dictionary<string, object?>(nodeParameters.Count + 2, StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in nodeParameters)
+        {
+            values[key] = value;
+        }
+
+        if (!values.ContainsKey("maxDegreeOfParallelism"))
+        {
+            values["maxDegreeOfParallelism"] = settings.MaxDegreeOfParallelism.ToString(CultureInfo.InvariantCulture);
+        }
+
+        if (!values.ContainsKey("spillThresholdBytes"))
+        {
+            values["spillThresholdBytes"] = settings.SpillThresholdBytes.ToString(CultureInfo.InvariantCulture);
+        }
+
+        if (!values.ContainsKey("gridShiftDirectory")
+            && !string.IsNullOrWhiteSpace(settings.GridShiftDirectory))
+        {
+            values["gridShiftDirectory"] = settings.GridShiftDirectory;
+        }
+
+        return new BlockParams(values);
+    }
+
+    private static CancellationTokenRegistration RegisterDrainEscalation(
+        CancellationToken drainCancellationToken,
+        int drainTimeoutSeconds,
+        CancellationTokenSource executionCts)
+    {
+        if (drainTimeoutSeconds <= 0 || !drainCancellationToken.CanBeCanceled)
+        {
+            return default;
+        }
+
+        return drainCancellationToken.Register(
+            static state =>
+            {
+                var escalation = (DrainEscalationState)state!;
+                _ = escalation.ExecuteAsync();
+            },
+            new DrainEscalationState(executionCts, drainTimeoutSeconds));
+    }
+}
+
+internal sealed class DrainEscalationState
+{
+    private readonly CancellationTokenSource _executionCts;
+    private readonly int _drainTimeoutSeconds;
+
+    public DrainEscalationState(CancellationTokenSource executionCts, int drainTimeoutSeconds)
+    {
+        _executionCts = executionCts;
+        _drainTimeoutSeconds = drainTimeoutSeconds;
+    }
+
+    public async Task ExecuteAsync()
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromSeconds(_drainTimeoutSeconds)).ConfigureAwait(false);
+            if (!_executionCts.IsCancellationRequested)
+            {
+                _executionCts.Cancel();
+            }
+        }
+        catch (ObjectDisposedException)
+        {
+            // Pipeline completed and disposed cancellation source.
+        }
+    }
+}
+
+internal sealed class BranchStoppedException : Exception
+{
+    public BranchStoppedException(string nodeId, string message, Exception? innerException = null)
+        : base($"Branch stopped at node '{nodeId}': {message}", innerException)
+    {
     }
 }
 

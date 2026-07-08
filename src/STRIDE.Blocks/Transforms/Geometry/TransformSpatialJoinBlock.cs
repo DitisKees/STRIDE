@@ -1,6 +1,7 @@
 using NetTopologySuite.Geometries;
 using NetTopologySuite.Index.Strtree;
 using STRIDE.Abstractions;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 
 namespace STRIDE.Blocks;
@@ -59,6 +60,7 @@ public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") :
         }
 
         index.Build();
+        var maxDegreeOfParallelism = BatchTransformUtilities.ResolveMaxDegreeOfParallelism(context.Parameters);
 
         while (await inputReader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
         {
@@ -76,18 +78,49 @@ public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") :
                 }
 
                 var inputGeometries = inputBatch.GeometryColumn(inputGeomOrdinal).Values;
-                var selectedRows = new List<int>(inputBatch.RowCount);
+                var matchedRows = new bool[inputBatch.RowCount];
 
-                for (var row = 0; row < inputBatch.RowCount; row++)
+                if (maxDegreeOfParallelism <= 1)
                 {
-                    if (inputGeometries[row] is not Geometry geometry)
+                    for (var row = 0; row < inputBatch.RowCount; row++)
                     {
-                        continue;
-                    }
+                        if (inputGeometries[row] is not Geometry geometry)
+                        {
+                            continue;
+                        }
 
-                    var candidates = index.Query(geometry.EnvelopeInternal);
-                    var matched = candidates.Any(candidate => Matches(geometry, candidate));
-                    if (matched)
+                        var candidates = index.Query(geometry.EnvelopeInternal);
+                        matchedRows[row] = candidates.Any(candidate => Matches(geometry, candidate));
+                    }
+                }
+                else
+                {
+                    Parallel.ForEach(
+                        Partitioner.Create(0, inputBatch.RowCount),
+                        new ParallelOptions
+                        {
+                            CancellationToken = cancellationToken,
+                            MaxDegreeOfParallelism = maxDegreeOfParallelism,
+                        },
+                        range =>
+                        {
+                            for (var row = range.Item1; row < range.Item2; row++)
+                            {
+                                if (inputGeometries[row] is not Geometry geometry)
+                                {
+                                    continue;
+                                }
+
+                                var candidates = index.Query(geometry.EnvelopeInternal);
+                                matchedRows[row] = candidates.Any(candidate => Matches(geometry, candidate));
+                            }
+                        });
+                }
+
+                var selectedRows = new List<int>(inputBatch.RowCount);
+                for (var row = 0; row < matchedRows.Length; row++)
+                {
+                    if (matchedRows[row])
                     {
                         selectedRows.Add(row);
                     }

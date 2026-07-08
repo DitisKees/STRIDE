@@ -4,7 +4,7 @@ using NetTopologySuite.Geometries;
 
 namespace STRIDE.Abstractions.Tests;
 
-public class UnitTest1
+public class AbstractionsRecordModelTests
 {
     [Fact]
     public void SchemaBuildsOrdinalLookupAndGeometryIndex()
@@ -73,5 +73,41 @@ public class UnitTest1
         var evaluator = ExpressionEvaluator.Compile("missing == 1");
 
         Assert.Throws<InvalidOperationException>(() => evaluator.Evaluate(batch, 0));
+    }
+
+    [Fact]
+    public void ExpressionEvaluatorMatchesRandomizedNumericPredicates()
+    {
+        var random = new Random(12345);
+        var schema = new Schema(ImmutableArray.Create(
+            new FieldDef("id", FieldType.Int64, false),
+            new FieldDef("score", FieldType.Float64, false)));
+
+        var rows = new List<string[]>(200);
+        for (var i = 0; i < 200; i++)
+        {
+            var id = random.Next(-100, 101);
+            var score = random.NextDouble() * 200d - 100d;
+            rows.Add([
+                id.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                score.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            ]);
+        }
+
+        var batch = RecordBatch.FromRows(schema, rows);
+
+        for (var iteration = 0; iteration < 50; iteration++)
+        {
+            var threshold = random.Next(-100, 101);
+            var expression = $"id >= {threshold}";
+            var evaluator = ExpressionEvaluator.Compile(expression);
+
+            for (var row = 0; row < batch.RowCount; row++)
+            {
+                var actual = evaluator.Evaluate(batch, row);
+                var expected = long.Parse(batch.GetValueAsString(0, row), System.Globalization.CultureInfo.InvariantCulture) >= threshold;
+                Assert.Equal(expected, actual);
+            }
+        }
     }
 }

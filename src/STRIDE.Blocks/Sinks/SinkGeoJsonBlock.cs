@@ -23,73 +23,154 @@ public sealed class SinkGeoJsonBlock(
             Directory.CreateDirectory(directory);
         }
 
-        await using var stream = File.Create(path);
-        using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+        var writeMode = SinkWriteModeUtilities.Parse(context.Parameters);
+        var destinationPath = writeMode.IsTransactional
+            ? SinkWriteModeUtilities.CreateTransactionalStagingPath(path)
+            : path;
 
-        writer.WriteStartObject();
-        writer.WriteString("type", "FeatureCollection");
-        writer.WritePropertyName("features");
-        writer.WriteStartArray();
+        var rowsWritten = 0L;
+        var batchesWritten = 0;
+        var completed = false;
 
-        while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
+        await using (var stream = File.Create(destinationPath))
         {
-            while (reader.TryRead(out var batch))
+            using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+            var documentClosed = false;
+
+            writer.WriteStartObject();
+            writer.WriteString("type", "FeatureCollection");
+            writer.WritePropertyName("features");
+            writer.WriteStartArray();
+
+            try
             {
-                if (batch.Schema.GeometryFieldIndex < 0)
+                while (await reader.WaitToReadAsync(cancellationToken).ConfigureAwait(false))
                 {
-                    throw new InvalidOperationException("SinkGeoJson requires an input geometry column.");
-                }
-
-                var geometryOrdinal = batch.Schema.GeometryFieldIndex;
-                var geometryValues = batch.GeometryColumn(geometryOrdinal).Values;
-
-                for (var row = 0; row < batch.RowCount; row++)
-                {
-                    writer.WriteStartObject();
-                    writer.WriteString("type", "Feature");
-
-                    writer.WritePropertyName("geometry");
-                    if (geometryValues[row] is Geometry geometry)
+                    while (reader.TryRead(out var batch))
                     {
-                        WriteGeometry(writer, geometry);
-                    }
-                    else
-                    {
-                        writer.WriteNullValue();
-                    }
-
-                    writer.WritePropertyName("properties");
-                    writer.WriteStartObject();
-                    if (includeProperties)
-                    {
-                        for (var c = 0; c < batch.Schema.Fields.Length; c++)
+                        if (batch.Schema.GeometryFieldIndex < 0)
                         {
-                            if (c == geometryOrdinal)
+                            throw new InvalidOperationException("SinkGeoJson requires an input geometry column.");
+                        }
+
+                        var geometryOrdinal = batch.Schema.GeometryFieldIndex;
+                        var geometryValues = batch.GeometryColumn(geometryOrdinal).Values;
+
+                        for (var row = 0; row < batch.RowCount; row++)
+                        {
+                            writer.WriteStartObject();
+                            writer.WriteString("type", "Feature");
+
+                            writer.WritePropertyName("geometry");
+                            if (geometryValues[row] is Geometry geometry)
                             {
-                                continue;
+                                WriteGeometry(writer, geometry);
+                            }
+                            else
+                            {
+                                writer.WriteNullValue();
                             }
 
-                            var field = batch.Schema.Fields[c];
-                            WriteProperty(
-                                writer,
-                                batch,
-                                field.Name,
-                                field.Type,
-                                c,
-                                row,
-                                includeNullAndEmptyProperties);
-                        }
-                    }
+                            writer.WritePropertyName("properties");
+                            writer.WriteStartObject();
+                            if (includeProperties)
+                            {
+                                for (var c = 0; c < batch.Schema.Fields.Length; c++)
+                                {
+                                    if (c == geometryOrdinal)
+                                    {
+                                        continue;
+                                    }
 
-                    writer.WriteEndObject();
-                    writer.WriteEndObject();
+                                    var field = batch.Schema.Fields[c];
+                                    WriteProperty(
+                                        writer,
+                                        batch,
+                                        field.Name,
+                                        field.Type,
+                                        c,
+                                        row,
+                                        includeNullAndEmptyProperties);
+                                }
+                            }
+
+                            writer.WriteEndObject();
+                            writer.WriteEndObject();
+                            rowsWritten++;
+                        }
+
+                        batchesWritten++;
+                        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    }
                 }
+
+                writer.WriteEndArray();
+                writer.WriteEndObject();
+                documentClosed = true;
+                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                completed = true;
+            }
+            catch
+            {
+                if (!documentClosed && !writeMode.IsTransactional)
+                {
+                    TryCompleteFeatureCollection(writer);
+                }
+
+                if (writeMode.IsTransactional)
+                {
+                    TryDelete(destinationPath);
+                }
+                else
+                {
+                    await context.Errors.WriteRecordErrorAsync(
+                        context.NodeId,
+                        $"SinkGeoJson partial write retained at '{path}'. rowsWritten={rowsWritten}, batchesWritten={batchesWritten}.",
+                        CancellationToken.None).ConfigureAwait(false);
+                }
+
+                throw;
             }
         }
 
-        writer.WriteEndArray();
-        writer.WriteEndObject();
-        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        if (completed && writeMode.IsTransactional)
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+
+            File.Move(destinationPath, path);
+        }
+    }
+
+    private static void TryCompleteFeatureCollection(Utf8JsonWriter writer)
+    {
+        try
+        {
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+            writer.Flush();
+        }
+        catch
+        {
+            // Best-effort close for partial files.
+        }
+    }
+
+    private static void TryDelete(string filePath)
+    {
+        try
+        {
+            if (File.Exists(filePath))
+            {
+                File.Delete(filePath);
+            }
+        }
+        catch
+        {
+            // Best-effort cleanup.
+        }
     }
 
     private static void WriteGeometry(Utf8JsonWriter writer, Geometry geometry)

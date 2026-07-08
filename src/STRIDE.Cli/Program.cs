@@ -12,7 +12,7 @@ if (args.Length == 0)
 var workflowPath = args[0];
 if (!File.Exists(workflowPath))
 {
-    Console.Error.WriteLine($"Workflow file not found: {workflowPath}");
+    await Console.Error.WriteLineAsync($"Workflow file not found: {workflowPath}");
     Environment.ExitCode = 1;
     return;
 }
@@ -26,14 +26,32 @@ var resolvedYaml = secretResolver.ResolveScalars(
 var loader = new WorkflowYamlLoader();
 var workflow = loader.Load(resolvedYaml);
 
-var cts = new CancellationTokenSource();
+using var drainCts = new CancellationTokenSource();
+using var abortCts = new CancellationTokenSource();
+var cancelPressCount = 0;
 Console.CancelKeyPress += (sender, eventArgs) =>
 {
     eventArgs.Cancel = true;
-    cts.Cancel();
+    var count = Interlocked.Increment(ref cancelPressCount);
+    if (count == 1)
+    {
+        Console.Error.WriteLine("Cancellation requested. Finishing in-flight batches and draining pipeline...");
+        drainCts.Cancel();
+        return;
+    }
+
+    if (count == 2)
+    {
+        Console.Error.WriteLine("Abort requested. Rolling back in-progress transactional sinks...");
+        abortCts.Cancel();
+        return;
+    }
+
+    Console.Error.WriteLine("Forced shutdown requested.");
+    Environment.Exit(130);
 };
 
 var runner = new PipelineRunner();
 var blockFactory = new GeneratedBlockFactory();
-var exitCode = await runner.RunAsync(workflow, blockFactory, cts.Token).ConfigureAwait(false);
+var exitCode = await runner.RunAsync(workflow, blockFactory, drainCts.Token, abortCts.Token).ConfigureAwait(false);
 Environment.ExitCode = exitCode;

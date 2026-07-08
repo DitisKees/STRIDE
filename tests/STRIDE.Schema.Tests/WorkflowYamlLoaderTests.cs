@@ -2,7 +2,7 @@
 
 namespace STRIDE.Schema.Tests;
 
-public class UnitTest1
+public class WorkflowYamlLoaderTests
 {
     [Fact]
     public void LoadParsesWorkflowNodesAndSinks()

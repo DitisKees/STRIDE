@@ -1,4 +1,5 @@
 using STRIDE.Abstractions;
+using Microsoft.Extensions.Logging;
 using System.Collections.Concurrent;
 using System.Text.Json;
 
@@ -9,9 +10,11 @@ internal sealed class ProgressMetricsSink : IBlockMetricsSink, IDisposable
     private readonly ConcurrentDictionary<string, NodeMetrics> _nodes = new(StringComparer.Ordinal);
     private readonly Timer _timer;
     private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
+    private readonly ILogger<ProgressMetricsSink>? _logger;
 
-    public ProgressMetricsSink()
+    public ProgressMetricsSink(ILogger<ProgressMetricsSink>? logger = null)
     {
+        _logger = logger;
         _timer = new Timer(static state => ((ProgressMetricsSink)state!).ReportProgress(), this, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
     }
 
@@ -53,6 +56,24 @@ internal sealed class ProgressMetricsSink : IBlockMetricsSink, IDisposable
             }
 
             var rowsPerSecond = snapshot.RowsOut / seconds;
+            if (_logger is not null)
+            {
+                using var scope = _logger.BeginScope(new Dictionary<string, object>
+                {
+                    ["nodeId"] = nodeId,
+                });
+
+                _logger.LogInformation(
+                    "NodeProgress inRows={InRows} outRows={OutRows} inBatches={InBatches} outBatches={OutBatches} errors={Errors} throughputRowsPerSec={ThroughputRowsPerSec} final={Final}",
+                    snapshot.RowsIn,
+                    snapshot.RowsOut,
+                    snapshot.BatchesIn,
+                    snapshot.BatchesOut,
+                    snapshot.Errors,
+                    rowsPerSecond,
+                    finalReport);
+            }
+
             Console.Error.WriteLine($"[{DateTimeOffset.UtcNow:O}] node={nodeId} inRows={snapshot.RowsIn} outRows={snapshot.RowsOut} inBatches={snapshot.BatchesIn} outBatches={snapshot.BatchesOut} errors={snapshot.Errors} throughputRowsPerSec={rowsPerSecond:F2}{(finalReport ? " final=true" : string.Empty)}");
         }
     }

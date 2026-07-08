@@ -4,6 +4,7 @@ using STRIDE.Abstractions;
 using System.Collections.Immutable;
 using System.Data.Common;
 using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace STRIDE.Blocks;
 
@@ -39,19 +40,42 @@ public class SourcePostGresQLBlock(string connectionString, string query, int ba
     public async IAsyncEnumerable<IRecordBatch> ExecuteAsync(BlockContext context, [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
         var schema = DeriveOutputSchema();
+        var checkpointPath = context.Parameters.GetOptionalString("checkpointPath");
+        var checkpointEvery = Math.Max(1, context.Parameters.GetOptionalInt32("checkpointEvery") ?? 10000);
+        var checkpointColumn = context.Parameters.GetOptionalString("checkpointColumn");
+        var checkpointToken = await SourceCheckpointUtilities.ReadTokenAsync(checkpointPath, cancellationToken).ConfigureAwait(false);
 
         await using var dataSource = CreateDataSource();
         await using var connection = await dataSource.OpenConnectionAsync(cancellationToken).ConfigureAwait(false);
-        await using var command = new NpgsqlCommand(query, connection);
+        await using var command = BuildQueryCommand(connection, checkpointColumn, checkpointToken);
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+
+        var checkpointOrdinal = ResolveCheckpointOrdinal(reader, checkpointColumn);
 
         var buffer = CreateBuffer(schema.Fields.Length);
         var rowCount = 0;
+        var processed = 0;
+        var lastCheckpointToken = checkpointToken;
 
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
             AppendRow(buffer, reader, schema);
             rowCount++;
+            processed++;
+
+            if (checkpointOrdinal >= 0 && !reader.IsDBNull(checkpointOrdinal))
+            {
+                lastCheckpointToken = SourceCheckpointUtilities.NormalizeDbValue(reader.GetValue(checkpointOrdinal));
+            }
+
+            if (!string.IsNullOrWhiteSpace(checkpointPath)
+                && checkpointOrdinal >= 0
+                && lastCheckpointToken is not null
+                && checkpointEvery > 0
+                && processed % checkpointEvery == 0)
+            {
+                await SourceCheckpointUtilities.WriteTokenAsync(checkpointPath, lastCheckpointToken, cancellationToken).ConfigureAwait(false);
+            }
 
             if (rowCount >= _batchSize)
             {
@@ -65,7 +89,63 @@ public class SourcePostGresQLBlock(string connectionString, string query, int ba
         {
             yield return BuildBatch(schema, buffer, rowCount);
         }
+
+        if (!string.IsNullOrWhiteSpace(checkpointPath)
+            && checkpointOrdinal >= 0
+            && lastCheckpointToken is not null)
+        {
+            await SourceCheckpointUtilities.WriteTokenAsync(checkpointPath, lastCheckpointToken, cancellationToken).ConfigureAwait(false);
+        }
     }
+
+    private NpgsqlCommand BuildQueryCommand(
+        NpgsqlConnection connection,
+        string? checkpointColumn,
+        object? checkpointToken)
+    {
+        if (string.IsNullOrWhiteSpace(checkpointColumn))
+        {
+            return new NpgsqlCommand(query, connection);
+        }
+
+        ValidateIdentifier(checkpointColumn);
+
+        var wrappedQuery = $"SELECT * FROM ({query}) AS stride_source";
+        var orderBy = QuoteIdentifier(checkpointColumn);
+
+        var sql = checkpointToken is null
+            ? $"{wrappedQuery} ORDER BY {orderBy}"
+            : $"{wrappedQuery} WHERE {orderBy} > @stride_checkpoint ORDER BY {orderBy}";
+
+        var command = new NpgsqlCommand(sql, connection);
+        if (checkpointToken is not null)
+        {
+            command.Parameters.AddWithValue("stride_checkpoint", SourceCheckpointUtilities.NormalizeDbValue(checkpointToken)!);
+        }
+
+        return command;
+    }
+
+    private static int ResolveCheckpointOrdinal(NpgsqlDataReader reader, string? checkpointColumn)
+    {
+        if (string.IsNullOrWhiteSpace(checkpointColumn))
+        {
+            return -1;
+        }
+
+        return reader.GetOrdinal(checkpointColumn);
+    }
+
+    private static void ValidateIdentifier(string identifier)
+    {
+        if (!Regex.IsMatch(identifier, "^[A-Za-z_][A-Za-z0-9_]*$", RegexOptions.CultureInvariant))
+        {
+            throw new InvalidOperationException($"Invalid checkpoint column '{identifier}'. Use a simple SQL identifier.");
+        }
+    }
+
+    private static string QuoteIdentifier(string value)
+        => $"\"{value.Replace("\"", "\"\"")}\"";
 
     private static NpgsqlDataSource CreateDataSource(string connectionString)
     {

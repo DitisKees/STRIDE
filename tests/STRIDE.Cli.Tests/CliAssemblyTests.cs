@@ -1,6 +1,6 @@
 ﻿namespace STRIDE.Cli.Tests;
 
-public class UnitTest1
+public class CliAssemblyTests
 {
     [Fact]
     public void CliAssemblyReferencesCoreBlocksAndSchema()

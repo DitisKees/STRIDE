@@ -3,6 +3,7 @@ using NetTopologySuite.Geometries;
 using STRIDE.Abstractions;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace STRIDE.Blocks;
 
@@ -27,6 +28,7 @@ public sealed class TransformReprojectBlock : ITransformBlock
         _outputGeometryFactory = NetTopologySuite.NtsGeometryServices.Instance.CreateGeometryFactory(srid: _targetSrid);
 
         GridShift.ThrowGridShiftMissingExceptions = true;
+        ValidateRequiredGridShiftTables(gridShiftDirectory);
         InitializeGridShifts(gridShiftDirectory);
 
         // Validate transform availability during workflow validation.
@@ -193,6 +195,84 @@ public sealed class TransformReprojectBlock : ITransformBlock
 
             GridShift.InitializeExternalGrids(fullPath, true);
         }
+    }
+
+    private void ValidateRequiredGridShiftTables(string? gridShiftDirectory)
+    {
+        var requiredGridShiftTables = GetRequiredGridShiftTables(_sourceProjection)
+            .Concat(GetRequiredGridShiftTables(_targetProjection))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+
+        if (requiredGridShiftTables.Length == 0)
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(gridShiftDirectory))
+        {
+            throw new InvalidOperationException(
+                $"Reprojection EPSG:{_sourceSrid} -> EPSG:{_targetSrid} requires grid shift tables ({string.Join(", ", requiredGridShiftTables)}), but no 'gridShiftDirectory' was provided.");
+        }
+
+        var fullPath = Path.GetFullPath(gridShiftDirectory);
+        if (!Directory.Exists(fullPath))
+        {
+            throw new InvalidOperationException($"Grid shift directory '{fullPath}' does not exist.");
+        }
+
+        foreach (var requiredTable in requiredGridShiftTables)
+        {
+            if (!GridShiftTableExists(fullPath, requiredTable))
+            {
+                throw new InvalidOperationException(
+                    $"Grid shift table '{requiredTable}' required for EPSG:{_sourceSrid} -> EPSG:{_targetSrid} was not found under '{fullPath}'.");
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetRequiredGridShiftTables(ProjectionInfo projection)
+    {
+        var datum = projection.GeographicInfo?.Datum;
+        if (datum?.NadGrids is null)
+        {
+            return Enumerable.Empty<string>();
+        }
+
+        return datum.NadGrids
+            .Where(static table => !string.IsNullOrWhiteSpace(table))
+            .Select(static table => table.Trim())
+            .Where(static table => !string.Equals(table, "null", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool GridShiftTableExists(string rootDirectory, string requiredTable)
+    {
+        var normalized = requiredTable.Trim().TrimStart('@');
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return true;
+        }
+
+        var hasExtension = Path.HasExtension(normalized);
+        var candidates = hasExtension
+            ? new[] { normalized }
+            : new[]
+            {
+                $"{normalized}.gsb",
+                $"{normalized}.dat",
+                $"{normalized}.lla",
+                $"{normalized}.los",
+            };
+
+        foreach (var candidate in candidates)
+        {
+            if (Directory.EnumerateFiles(rootDirectory, candidate, SearchOption.AllDirectories).Any())
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     private bool TryCreateValidationTransform()

@@ -39,9 +39,11 @@ public sealed class WorkflowYamlLoader
         {
             BatchSize = OptionalInt(node, "batchSize") ?? 1000,
             MaxDegreeOfParallelism = OptionalInt(node, "maxDegreeOfParallelism") ?? Environment.ProcessorCount,
+            DrainTimeoutSeconds = OptionalInt(node, "drainTimeoutSeconds") ?? 30,
             SpillDirectory = OptionalScalar(node, "spillDirectory") ?? "./.stride-spill",
             SpillThresholdBytes = OptionalLong(node, "spillThresholdBytes") ?? 1_073_741_824L,
             ErrorLog = OptionalScalar(node, "errorLog") ?? "./output/error_log.ndjson",
+            GridShiftDirectory = OptionalScalar(node, "gridShiftDirectory") ?? "./grids",
         };
     }
 

@@ -1,0 +1,32 @@
+version: "1.0"
+name: "postgres-filter-geojson-template"
+settings:
+  batchSize: 1000
+  maxDegreeOfParallelism: 8
+  spillDirectory: "./.stride-spill"
+  spillThresholdBytes: 10485760
+  errorLog: "./output/error_log.ndjson"
+
+nodes:
+  - id: source
+    type: SourcePostGresQL
+    params:
+      connectionString: "${STRIDE_PG_CONNECTION_STRING}"
+      query: "SELECT * FROM gvdata.gv_put"
+      batchSize: "1000"
+  - id: buffer
+    type: TransformBuffer
+    inputs:
+      in: source
+    params:
+      distance: 5
+
+sinks:
+  - id: sinkJson
+    type: SinkGeoJson
+    inputs:
+      in: buffer
+    params:
+      path: "./output/features.geojson"
+      includeProperties: "true"
+      includeNullAndEmptyProperties: "false"

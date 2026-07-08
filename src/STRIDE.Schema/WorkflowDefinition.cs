@@ -21,11 +21,16 @@ public sealed class WorkflowSettings
 
     public int MaxDegreeOfParallelism { get; init; } = Environment.ProcessorCount;
 
+    public int DrainTimeoutSeconds { get; init; } = 30;
+
     public string SpillDirectory { get; init; } = "./.stride-spill";
 
     public long SpillThresholdBytes { get; init; } = 1_073_741_824L;
 
     public string ErrorLog { get; init; } = "./output/error_log.ndjson";
+
+    public string? GridShiftDirectory { get; init; }
+        = "./grids";
 }
 
 public sealed class WorkflowNodeDefinition

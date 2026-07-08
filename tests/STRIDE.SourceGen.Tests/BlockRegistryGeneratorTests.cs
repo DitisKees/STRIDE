@@ -1,6 +1,6 @@
 ﻿namespace STRIDE.SourceGen.Tests;
 
-public class UnitTest1
+public class BlockRegistryGeneratorTests
 {
     [Fact]
     public void BlockRegistryGeneratorImplementsIncrementalGenerator()

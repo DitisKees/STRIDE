@@ -1,0 +1,34 @@
+version: "1.0"
+name: "csv-filter-demo"
+settings:
+  batchSize: 2
+  maxDegreeOfParallelism: 2
+  spillDirectory: "./.stride-spill"
+  spillThresholdBytes: 10485760
+  errorLog: "./output/error_log.ndjson"
+
+nodes:
+  - id: source
+    type: SourceCsv
+    params:
+      path: "./sample-data/input.csv"
+      columns: "id,status"
+      hasHeader: "true"
+      delimiter: ","
+
+  - id: filter
+    type: TransformFilter
+    inputs:
+      in: source
+    params:
+      when: "id > 10"
+
+sinks:
+  - id: sink
+    type: SinkCsv
+    inputs:
+      in: filter
+    params:
+      path: "./output/filtered.csv"
+      includeHeader: "true"
+      delimiter: ","
