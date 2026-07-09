@@ -5,7 +5,7 @@ using NetTopologySuite.IO;
 using STRIDE.Abstractions;
 using STRIDE.Blocks;
 using System.Collections.Immutable;
-using System.Data.SQLite;
+using Microsoft.Data.Sqlite;
 using System.Text.Json;
 using System.Threading.Channels;
 using Schema = STRIDE.Abstractions.Schema;
@@ -245,7 +245,7 @@ public class BlockIntegrationTests
         var point = geometryFactory.CreatePoint(new Coordinate(4.9, 52.3));
         var wkb = new WKBWriter().Write(point);
 
-        using (var connection = new SQLiteConnection($"Data Source={gpkgPath};Version=3;"))
+        using (var connection = new SqliteConnection($"Data Source={gpkgPath}"))
         {
             connection.Open();
 
@@ -532,7 +532,7 @@ public class BlockIntegrationTests
     }
 
     [Fact]
-    public async Task TransformSpatialJoinFiltersInputByLookupGeometry()
+    public async Task TransformSpatialFilterFiltersInputByLookupGeometry()
     {
         var geometryFactory = NetTopologySuite.NtsGeometryServices.Instance.CreateGeometryFactory(srid: 4326);
         var schema = new Schema(ImmutableArray.Create(
@@ -570,7 +570,7 @@ public class BlockIntegrationTests
         input.Writer.TryComplete();
         lookup.Writer.TryComplete();
 
-        var block = new TransformSpatialJoinBlock("Intersects");
+        var block = new TransformSpatialFilterBlock("Intersects");
         var context = new BlockContext(
             "join",
             new Dictionary<string, ChannelReader<IRecordBatch>>(StringComparer.OrdinalIgnoreCase)
@@ -598,7 +598,7 @@ public class BlockIntegrationTests
     }
 
     [Fact]
-    public async Task TransformSpatialJoinSupportsParallelQueriesAfterIndexBuild()
+    public async Task TransformSpatialFilterSupportsParallelQueriesAfterIndexBuild()
     {
         var geometryFactory = NetTopologySuite.NtsGeometryServices.Instance.CreateGeometryFactory(srid: 4326);
         var schema = new Schema(ImmutableArray.Create(
@@ -640,7 +640,7 @@ public class BlockIntegrationTests
         input.Writer.TryComplete();
         lookup.Writer.TryComplete();
 
-        var block = new TransformSpatialJoinBlock("Intersects");
+        var block = new TransformSpatialFilterBlock("Intersects");
         var context = new BlockContext(
             "join",
             new Dictionary<string, ChannelReader<IRecordBatch>>(StringComparer.OrdinalIgnoreCase)
@@ -991,6 +991,160 @@ public class BlockIntegrationTests
 
         Assert.Equal(maxRows, emittedRows);
         Assert.Equal(3, emittedBatches);
+    }
+
+    [Fact]
+    public async Task TransformSpatialEnrichLeftJoinCopiesAttributesAndKeepsUnmatchedRows()
+    {
+        var geometryFactory = NetTopologySuite.NtsGeometryServices.Instance.CreateGeometryFactory(srid: 4326);
+
+        var inputSchema = new Schema(ImmutableArray.Create(
+            new FieldDef("id", FieldType.Int64, false),
+            new FieldDef("geom", FieldType.Geometry, true)));
+
+        // point inside polygon (id=1) and point outside (id=2)
+        var inputBatch = new RecordBatch(inputSchema, 2, new object?[]
+        {
+            new long[] { 1L, 2L },
+            new GeometryColumn(new Geometry?[]
+            {
+                geometryFactory.CreatePoint(new Coordinate(5, 52)),
+                geometryFactory.CreatePoint(new Coordinate(50, 50)),
+            }),
+        });
+
+        var lookupSchema = new Schema(ImmutableArray.Create(
+            new FieldDef("buurt", FieldType.Utf8String, true),
+            new FieldDef("geom", FieldType.Geometry, true)));
+
+        var lookupPolygon = geometryFactory.CreatePolygon([
+            new Coordinate(4, 51), new Coordinate(6, 51),
+            new Coordinate(6, 53), new Coordinate(4, 53),
+            new Coordinate(4, 51),
+        ]);
+
+        var lookupBatch = new RecordBatch(lookupSchema, 1, new object?[]
+        {
+            RecordBatch.CreateUtf8Column(["Centrum"]),
+            new GeometryColumn(new Geometry?[] { lookupPolygon }),
+        });
+
+        var input = Channel.CreateUnbounded<IRecordBatch>();
+        var lookup = Channel.CreateUnbounded<IRecordBatch>();
+        await input.Writer.WriteAsync(inputBatch);
+        await lookup.Writer.WriteAsync(lookupBatch);
+        input.Writer.TryComplete();
+        lookup.Writer.TryComplete();
+
+        var block = new TransformSpatialEnrichBlock(attributes: "buurt", joinType: "left");
+        var context = new BlockContext(
+            "enrich",
+            new Dictionary<string, ChannelReader<IRecordBatch>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["in"] = input.Reader,
+                ["lookup"] = lookup.Reader,
+            },
+            new Dictionary<string, ChannelWriter<IRecordBatch>>(StringComparer.OrdinalIgnoreCase),
+            new TestSpillManager(),
+            new TestMetricsSink(),
+            new TestErrorSink(),
+            ErrorPolicy.StopPipeline,
+            BlockParams.Empty,
+            CancellationToken.None);
+
+        var outputs = new List<IRecordBatch>();
+        await foreach (var output in block.ExecuteAsync(context, CancellationToken.None))
+        {
+            outputs.Add(output);
+        }
+
+        Assert.Single(outputs);
+        Assert.Equal(2, outputs[0].RowCount);
+
+        // Output schema: id, geom, buurt
+        Assert.Equal(3, outputs[0].Schema.Fields.Length);
+        Assert.Equal("buurt", outputs[0].Schema.Fields[2].Name);
+
+        // Row 0 (inside polygon): buurt = "Centrum"
+        Assert.Equal("Centrum", outputs[0].GetValueAsString(2, 0));
+
+        // Row 1 (outside polygon): buurt = "" (null/empty — left join)
+        Assert.Equal(string.Empty, outputs[0].GetValueAsString(2, 1));
+    }
+
+    [Fact]
+    public async Task TransformSpatialEnrichInnerJoinExcludesUnmatchedRows()
+    {
+        var geometryFactory = NetTopologySuite.NtsGeometryServices.Instance.CreateGeometryFactory(srid: 4326);
+
+        var inputSchema = new Schema(ImmutableArray.Create(
+            new FieldDef("id", FieldType.Int64, false),
+            new FieldDef("geom", FieldType.Geometry, true)));
+
+        var inputBatch = new RecordBatch(inputSchema, 3, new object?[]
+        {
+            new long[] { 1L, 2L, 3L },
+            new GeometryColumn(new Geometry?[]
+            {
+                geometryFactory.CreatePoint(new Coordinate(5, 52)),   // inside
+                geometryFactory.CreatePoint(new Coordinate(50, 50)),  // outside
+                geometryFactory.CreatePoint(new Coordinate(4.5, 51.5)), // inside
+            }),
+        });
+
+        var lookupSchema = new Schema(ImmutableArray.Create(
+            new FieldDef("wijk", FieldType.Utf8String, true),
+            new FieldDef("geom", FieldType.Geometry, true)));
+
+        var lookupPolygon = geometryFactory.CreatePolygon([
+            new Coordinate(4, 51), new Coordinate(6, 51),
+            new Coordinate(6, 53), new Coordinate(4, 53),
+            new Coordinate(4, 51),
+        ]);
+
+        var lookupBatch = new RecordBatch(lookupSchema, 1, new object?[]
+        {
+            RecordBatch.CreateUtf8Column(["Noord"]),
+            new GeometryColumn(new Geometry?[] { lookupPolygon }),
+        });
+
+        var input = Channel.CreateUnbounded<IRecordBatch>();
+        var lookup = Channel.CreateUnbounded<IRecordBatch>();
+        await input.Writer.WriteAsync(inputBatch);
+        await lookup.Writer.WriteAsync(lookupBatch);
+        input.Writer.TryComplete();
+        lookup.Writer.TryComplete();
+
+        var block = new TransformSpatialEnrichBlock(attributes: "wijk", joinType: "inner");
+        var context = new BlockContext(
+            "enrich",
+            new Dictionary<string, ChannelReader<IRecordBatch>>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["in"] = input.Reader,
+                ["lookup"] = lookup.Reader,
+            },
+            new Dictionary<string, ChannelWriter<IRecordBatch>>(StringComparer.OrdinalIgnoreCase),
+            new TestSpillManager(),
+            new TestMetricsSink(),
+            new TestErrorSink(),
+            ErrorPolicy.StopPipeline,
+            BlockParams.Empty,
+            CancellationToken.None);
+
+        var outputs = new List<IRecordBatch>();
+        await foreach (var output in block.ExecuteAsync(context, CancellationToken.None))
+        {
+            outputs.Add(output);
+        }
+
+        Assert.Single(outputs);
+        Assert.Equal(2, outputs[0].RowCount);
+
+        // Only the two inside-polygon rows survive
+        Assert.Equal(1L, outputs[0].Column<long>(0)[0]);
+        Assert.Equal(3L, outputs[0].Column<long>(0)[1]);
+        Assert.Equal("Noord", outputs[0].GetValueAsString(2, 0));
+        Assert.Equal("Noord", outputs[0].GetValueAsString(2, 1));
     }
 
     private sealed class TestSpillManager : ISpillManager

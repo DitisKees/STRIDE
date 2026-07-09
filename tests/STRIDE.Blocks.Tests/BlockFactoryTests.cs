@@ -23,7 +23,7 @@ public class BlockFactoryTests
         Assert.Contains("TransformAggregator", factory.RegisteredTypes);
         Assert.Contains("TransformBuffer", factory.RegisteredTypes);
         Assert.Contains("TransformReproject", factory.RegisteredTypes);
-        Assert.Contains("TransformSpatialJoin", factory.RegisteredTypes);
+        Assert.Contains("TransformSpatialFilter", factory.RegisteredTypes);
         Assert.Contains("TransformConditionalSplitter", factory.RegisteredTypes);
         Assert.Contains("TransformFilter", factory.RegisteredTypes);
         Assert.Contains("SinkCsv", factory.RegisteredTypes);

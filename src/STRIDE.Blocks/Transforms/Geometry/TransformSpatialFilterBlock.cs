@@ -6,8 +6,8 @@ using System.Runtime.InteropServices;
 
 namespace STRIDE.Blocks;
 
-[StrideBlock("TransformSpatialJoin")]
-public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") : ITransformBlock
+[StrideBlock("TransformSpatialFilter")]
+public sealed class TransformSpatialFilterBlock(string predicate = "Intersects") : ITransformBlock
 {
     private readonly string _predicate = predicate;
 
@@ -18,12 +18,12 @@ public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") :
         var input = inputSchemas["in"];
         if (input.GeometryFieldIndex < 0)
         {
-            throw new InvalidOperationException("TransformSpatialJoin requires a geometry field on the 'in' input.");
+            throw new InvalidOperationException("TransformSpatialFilter requires a geometry field on the 'in' input.");
         }
 
         if (!inputSchemas.TryGetValue("lookup", out var lookup) || lookup.GeometryFieldIndex < 0)
         {
-            throw new InvalidOperationException("TransformSpatialJoin requires a geometry field on the 'lookup' input.");
+            throw new InvalidOperationException("TransformSpatialFilter requires a geometry field on the 'lookup' input.");
         }
 
         return input;
@@ -45,7 +45,7 @@ public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") :
                 var lookupGeomOrdinal = lookupBatch.Schema.GeometryFieldIndex;
                 if (lookupGeomOrdinal < 0)
                 {
-                    throw new InvalidOperationException("TransformSpatialJoin requires geometry in the lookup stream.");
+                    throw new InvalidOperationException("TransformSpatialFilter requires geometry in the lookup stream.");
                 }
 
                 var values = lookupBatch.GeometryColumn(lookupGeomOrdinal).Values;
@@ -74,7 +74,7 @@ public sealed class TransformSpatialJoinBlock(string predicate = "Intersects") :
                 var inputGeomOrdinal = inputBatch.Schema.GeometryFieldIndex;
                 if (inputGeomOrdinal < 0)
                 {
-                    throw new InvalidOperationException("TransformSpatialJoin requires geometry in the input stream.");
+                    throw new InvalidOperationException("TransformSpatialFilter requires geometry in the input stream.");
                 }
 
                 var inputGeometries = inputBatch.GeometryColumn(inputGeomOrdinal).Values;

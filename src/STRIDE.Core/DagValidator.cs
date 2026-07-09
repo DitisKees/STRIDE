@@ -8,7 +8,8 @@ public sealed class DagValidator
     private static readonly IReadOnlyDictionary<string, int> RequiredInputCountByType =
         new Dictionary<string, int>(StringComparer.Ordinal)
         {
-            ["TransformSpatialJoin"] = 2,
+            ["TransformSpatialFilter"] = 2,
+            ["TransformSpatialEnrich"] = 2,
             ["TransformDifference"] = 2,
             ["TransformSnapGeometries"] = 2,
         };

@@ -3,7 +3,7 @@ using NetTopologySuite.IO;
 using STRIDE.Abstractions;
 using System.Collections.Immutable;
 using System.Globalization;
-using System.Data.SQLite;
+using Microsoft.Data.Sqlite;
 
 namespace STRIDE.Blocks;
 
@@ -133,10 +133,10 @@ public sealed class SourceGeoPackageBlock(
         }
     }
 
-    private SQLiteConnection OpenConnection()
-        => new($"Data Source={path};Read Only=True");
+    private SqliteConnection OpenConnection()
+        => new($"Data Source={path};Mode=ReadOnly");
 
-    private string ResolveTableName(SQLiteConnection? connection)
+    private string ResolveTableName(SqliteConnection? connection)
     {
         if (!string.IsNullOrWhiteSpace(_resolvedTable))
         {
@@ -178,7 +178,7 @@ public sealed class SourceGeoPackageBlock(
         }
     }
 
-    private string? ResolveGeoPackageGeometryColumn(SQLiteConnection connection, string tableName)
+    private string? ResolveGeoPackageGeometryColumn(SqliteConnection connection, string tableName)
     {
         using var command = connection.CreateCommand();
         command.CommandText = "SELECT column_name FROM gpkg_geometry_columns WHERE table_name = $table LIMIT 1;";
